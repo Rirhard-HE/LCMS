@@ -4,7 +4,7 @@
   "description": "Backend for LCMS (Legal Case Management System)",
   "main": "server.js",
   "scripts": {
-    "test": "cross-env NODE_ENV=test mocha --no-config --no-package --recursive --timeout 30000 --exit --require \"$PWD/test/setup.cjs\" \"test/**/*.test.js\" \"test/**/*.spec.js\"",
+    "test": "cross-env NODE_ENV=test mocha --recursive --timeout 30000 --exit --require ./test/setup.cjs \"test/**/*.test.js\" \"test/**/*.spec.js\"",
     "start": "node server.js",
     "dev": "nodemon server.js",
     "prod": "node server.js"
@@ -28,7 +28,6 @@
     "nodemon": "^2.0.15",
     "sinon": "^19.0.2",
     "supertest": "^6.3.3"
-    
   },
   "author": "LCMS Team",
   "license": "ISC"
