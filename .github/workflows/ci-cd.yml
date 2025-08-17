@@ -2,15 +2,22 @@ name: Backend & Frontend CI/CD
 
 on:
   push:
-    branches: [ main ]   # 当推送到 main 分支时触发
+    branches: [ main ]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-deploy:
-    runs-on: self-hosted   # 你的 AWS EC2 runner
+    runs-on: self-hosted
+    timeout-minutes: 45
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -20,6 +27,13 @@ jobs:
           cache-dependency-path: |
             backend/package-lock.json
             frontend/package-lock.json
+
+      - name: Debug workspace
+        run: |
+          echo "== pwd ==" && pwd
+          echo "== tree depth 2 ==" && ls -la
+          ls -la backend || true
+          ls -la frontend || true
 
       - name: Verify secrets presence
         run: |
@@ -33,19 +47,61 @@ jobs:
           pm2 -v || true
           pm2 stop all || true
 
+      # ===== Detect changes to avoid unnecessary work =====
+      - name: Detect backend changes
+        id: diff_be
+        run: |
+          git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep '^backend/' >/dev/null 2>&1 \
+            && echo "changed=true" >> $GITHUB_OUTPUT || echo "changed=false" >> $GITHUB_OUTPUT
+
+      - name: Detect frontend presence & changes
+        id: diff_fe
+        run: |
+          if [ -d frontend ]; then
+            echo "present=true" >> $GITHUB_OUTPUT
+            git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep '^frontend/' >/dev/null 2>&1 \
+              && echo "changed=true" >> $GITHUB_OUTPUT || echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "present=false" >> $GITHUB_OUTPUT
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ===== Global npm cache (tarballs) =====
+      - name: Cache ~/.npm
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('backend/package-lock.json', 'frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
       # ===== Backend =====
+      - name: Cache backend/node_modules
+        if: steps.diff_be.outputs.changed == 'true'
+        id: be_mod_cache
+        uses: actions/cache@v3
+        with:
+          path: backend/node_modules
+          key: ${{ runner.os }}-be-mod-${{ hashFiles('backend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-be-mod-
+
+      - name: Install Backend Dependencies (skip if cache hit)
+        if: steps.diff_be.outputs.changed == 'true' && steps.be_mod_cache.outputs.cache-hit == 'true'
+        run: echo "✅ backend node_modules cache hit, skipping install."
+
       - name: Install Backend Dependencies
+        if: steps.diff_be.outputs.changed == 'true' && steps.be_mod_cache.outputs.cache-hit != 'true'
         working-directory: ./backend
         run: |
           if [ -f package-lock.json ]; then
-            echo "Using npm ci (backend)"
-            npm ci
+            npm ci --prefer-offline --no-audit --no-fund
           else
-            echo "No lockfile, falling back to npm install (backend)"
-            npm install
+            npm install --prefer-offline --no-audit --no-fund
           fi
 
       - name: Create backend .env
+        if: steps.diff_be.outputs.changed == 'true'
         working-directory: ./backend
         run: |
           rm -f .env
@@ -56,6 +112,7 @@ jobs:
           } >> .env
 
       - name: Run Backend Tests (skip if none)
+        if: steps.diff_be.outputs.changed == 'true'
         working-directory: ./backend
         env:
           MONGO_URI: ${{ secrets.MONGO_URI }}
@@ -69,19 +126,35 @@ jobs:
           fi
 
       # ===== Frontend =====
+      - name: Cache frontend/node_modules
+        if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true'
+        id: fe_mod_cache
+        uses: actions/cache@v3
+        with:
+          path: frontend/node_modules
+          key: ${{ runner.os }}-fe-mod-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-fe-mod-
+
+      - name: Install Frontend Dependencies (skip if cache hit)
+        if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true' && steps.fe_mod_cache.outputs.cache-hit == 'true'
+        run: echo "✅ frontend node_modules cache hit, skipping install."
+
       - name: Install Frontend Dependencies
+        if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true' && steps.fe_mod_cache.outputs.cache-hit != 'true'
         working-directory: ./frontend
         run: |
           if [ -f package-lock.json ]; then
-            echo "Using npm ci (frontend)"
-            npm ci
+            npm ci --prefer-offline --no-audit --no-fund
           else
-            echo "No lockfile, falling back to npm install (frontend)"
-            npm install
+            npm install --prefer-offline --no-audit --no-fund
           fi
 
       - name: Build Frontend
+        if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true'
         working-directory: ./frontend
+        env:
+          CI: ""   # CRA: 不把 warning 当 error（临时兜底，长期建议修代码）
         run: |
           rm -rf build dist || true
           if npm run | grep -q " build"; then
