@@ -2,11 +2,12 @@ name: Backend & Frontend CI (self-hosted)
 
 on:
   push:
-    branches: [ main ]   
+    branches: [ main ]
 
 jobs:
   build-and-test:
     runs-on: self-hosted
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -15,10 +16,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'yarn'
+          cache: 'npm'
           cache-dependency-path: |
-            backend/yarn.lock
-            frontend/yarn.lock
+            backend/package-lock.json
+            frontend/package-lock.json
 
       - name: Verify secrets presence (do NOT print values)
         run: |
@@ -35,14 +36,7 @@ jobs:
       # ===== Backend =====
       - name: Install Backend Dependencies
         working-directory: ./backend
-        run: |
-          if [ -f yarn.lock ]; then
-            yarn install --frozen-lockfile
-          elif [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+        run: npm ci
 
       - name: Create backend .env from repository secrets
         working-directory: ./backend
@@ -62,29 +56,15 @@ jobs:
           PORT: ${{ secrets.PORT }}
         run: |
           if ls test/*.js 2>/dev/null || ls **/*.test.js **/*.spec.js 2>/dev/null; then
-            
-            if npm run | grep -q " test"; then
-              npm test
-            elif yarn run | grep -q " test"; then
-              yarn test
-            else
-              echo "No test script defined, skipping."
-            fi
+            npm test
           else
-            echo "No test files found, skipping."
+            echo "No backend tests found, skipping."
           fi
 
       # ===== Frontend =====
       - name: Install Frontend Dependencies
         working-directory: ./frontend
-        run: |
-          if [ -f yarn.lock ]; then
-            yarn install --frozen-lockfile
-          elif [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+        run: npm ci
 
       - name: Build Frontend
         working-directory: ./frontend
@@ -92,15 +72,13 @@ jobs:
           rm -rf build dist || true
           if npm run | grep -q " build"; then
             npm run build
-          elif yarn run | grep -q " build"; then
-            yarn build
           else
             echo "No build script defined for frontend. Skipping build."
           fi
 
-
-      - name: Start/Restart via PM2
+      # ===== Start/Restart with PM2 =====
+      - name: Start/Restart Backend with PM2
         run: |
           pm2 list || true
-          pm2 restart all || pm2 start backend/server.js --name lcms-backend || true
+          pm2 restart lcms-backend || pm2 start backend/app.js --name lcms-backend
           pm2 save || true
