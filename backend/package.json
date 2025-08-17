@@ -1,10 +1,10 @@
 {
-  "name": "task-manager-backend",
+  "name": "lcms-backend",
   "version": "1.0.0",
-  "description": "Backend for Task Manager App",
+  "description": "Backend for LCMS (Legal Case Management System)",
   "main": "server.js",
   "scripts": {
-    "test": "mocha",
+    "test": "cross-env NODE_ENV=test mocha",
     "start": "node server.js",
     "dev": "nodemon server.js",
     "prod": "node server.js"
@@ -12,23 +12,23 @@
   "dependencies": {
     "bcrypt": "^5.0.1",
     "bcryptjs": "^2.4.3",
-    "chai": "^4.5.0",
-    "chai-http": "^4.3.0",
     "cors": "^2.8.5",
     "dotenv": "^10.0.0",
     "express": "^4.17.1",
     "express-async-handler": "^1.2.0",
     "jsonwebtoken": "^8.5.1",
     "mongoose": "^6.0.14",
-    "multer": "^2.0.2",
-    "request": "^2.88.2"
+    "multer": "^2.0.2"
   },
   "devDependencies": {
-    "esm": "^3.2.25",
+    "chai": "^4.5.0",
     "mocha": "^11.0.1",
     "nodemon": "^2.0.15",
-    "sinon": "^19.0.2"
+    "sinon": "^19.0.2",
+    "supertest": "^6.3.3",
+    "mongodb-memory-server": "^9.0.0",
+    "cross-env": "^7.0.3"
   },
-  "author": "Task Manager Team",
+  "author": "LCMS Team",
   "license": "ISC"
 }
