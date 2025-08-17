@@ -1,4 +1,4 @@
-name: Backend & Frontend CI/CD
+name: Backend & Frontend CI/CD (optimized, detect nginx root)
 
 on:
   push:
@@ -13,8 +13,14 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 45
 
+    env:
+      NODE_VERSION: '22'
+      PROCESS_NAME: 'lcms-backend'        # PM2 进程名
+      BACKEND_ENTRY: 'backend/server.js'  # 后端入口
+      CRA_CI_FLAG: ''                     # CRA: 空=不把 warning 当 error（修干净后可去掉）
+
     steps:
-      - name: Checkout code
+      - name: Checkout (shallow)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -22,7 +28,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
           cache-dependency-path: |
             backend/package-lock.json
@@ -31,23 +37,22 @@ jobs:
       - name: Debug workspace
         run: |
           echo "== pwd ==" && pwd
-          echo "== tree depth 2 ==" && ls -la
-          ls -la backend || true
-          ls -la frontend || true
+          echo "== root ==" && ls -la || true
+          echo "== backend ==" && ls -la backend || true
+          echo "== frontend ==" && ls -la frontend || true
 
-      - name: Verify secrets presence
+      - name: Verify secrets presence (masked)
         run: |
           echo "MONGO_URI set?: ${{ secrets.MONGO_URI != '' }}"
           echo "JWT_SECRET set?: ${{ secrets.JWT_SECRET != '' }}"
           echo "PORT set?: ${{ secrets.PORT != '' }}"
 
-      - name: Ensure pm2 available & stop existing apps
+      - name: Ensure pm2 available
         run: |
           npm i -g pm2 || true
           pm2 -v || true
-          pm2 stop all || true
 
-      # ===== Detect changes to avoid unnecessary work =====
+      # ---------- Change detection ----------
       - name: Detect backend changes
         id: diff_be
         run: |
@@ -66,8 +71,8 @@ jobs:
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
 
-      # ===== Global npm cache (tarballs) =====
-      - name: Cache ~/.npm
+      # ---------- Global npm cache ----------
+      - name: Cache ~/.npm (tarballs)
         uses: actions/cache@v3
         with:
           path: ~/.npm
@@ -75,7 +80,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-npm-
 
-      # ===== Backend =====
+      # ====================== Backend ======================
       - name: Cache backend/node_modules
         if: steps.diff_be.outputs.changed == 'true'
         id: be_mod_cache
@@ -119,13 +124,20 @@ jobs:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           PORT: ${{ secrets.PORT }}
         run: |
-          if ls test/*.js 2>/dev/null || ls **/*.test.js **/*.spec.js 2>/dev/null; then
+          if [ -f package.json ] && (cat package.json | grep -q "\"test\"" ); then
+            npm test
+          elif ls test/*.js 2>/dev/null || ls **/*.test.js **/*.spec.js 2>/dev/null; then
             npm test
           else
             echo "No backend tests found, skipping."
           fi
 
-      # ===== Frontend =====
+      - name: Restart/Start backend with PM2
+        run: |
+          pm2 restart "${{ env.PROCESS_NAME }}" || pm2 start "${{ env.BACKEND_ENTRY }}" --name "${{ env.PROCESS_NAME }}"
+          pm2 save || true
+
+      # ====================== Frontend ======================
       - name: Cache frontend/node_modules
         if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true'
         id: fe_mod_cache
@@ -150,11 +162,11 @@ jobs:
             npm install --prefer-offline --no-audit --no-fund
           fi
 
-      - name: Build Frontend
+      - name: Build Frontend (CRA: do not fail on warnings)
         if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true'
         working-directory: ./frontend
         env:
-          CI: ""   # CRA: 不把 warning 当 error（临时兜底，长期建议修代码）
+          CI: ${{ env.CRA_CI_FLAG }}   # 空字符串=不把 warning 当 error
         run: |
           rm -rf build dist || true
           if npm run | grep -q " build"; then
@@ -163,9 +175,28 @@ jobs:
             echo "No build script defined for frontend. Skipping build."
           fi
 
-      # ===== Start/Restart Backend with PM2 =====
-      - name: Start/Restart Backend with PM2
+      # ---------- Detect nginx web root (filesystem path) ----------
+      - name: Detect Nginx web root
+        id: nginx_root
         run: |
-          pm2 list || true
-          pm2 restart lcms-backend || pm2 start backend/app.js --name lcms-backend
-          pm2 save || true
+          set -e
+          ROOT=$(sudo nginx -T 2>/dev/null | grep -i ' root ' | grep -v '#' | head -n1 | awk '{print $2}' | sed 's/;//')
+          if [ -z "$ROOT" ]; then
+            # 常见默认值：优先 /usr/share/nginx/html，再退回 /var/www/html
+            if [ -d /usr/share/nginx/html ]; then
+              ROOT="/usr/share/nginx/html"
+            else
+              ROOT="/var/www/html"
+            fi
+          fi
+          echo "Nginx root detected: $ROOT"
+          echo "NGINX_ROOT=$ROOT" >> $GITHUB_ENV
+
+      - name: Deploy Frontend to Nginx root
+        if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true'
+        run: |
+          echo "Target: $NGINX_ROOT"
+          sudo mkdir -p "$NGINX_ROOT"
+          sudo rm -rf "$NGINX_ROOT"/*
+          sudo cp -r frontend/build/* "$NGINX_ROOT"/
+          sudo nginx -t && sudo systemctl reload nginx || true
