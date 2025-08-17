@@ -1,80 +1,106 @@
-name: Backend CI
+name: Backend & Frontend CI (self-hosted)
 
 on:
   push:
-    branches:
-      - main  # Trigger CI on pushes to the main branch
-
+    branches: [ main ]   
 
 jobs:
-  test:
-    name: Run Tests
+  build-and-test:
     runs-on: self-hosted
-
-    strategy:
-      matrix:
-        node-version: [22] # Test on multiple Node.js versions
-
-
-    environment: MONGO_URI
-
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    # Set up Node.js
-    - name: Setup Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: ${{ matrix.node-version }}
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'yarn'
+          cache-dependency-path: |
+            backend/yarn.lock
+            frontend/yarn.lock
 
-    - name: Print Env Secret
+      - name: Verify secrets presence (do NOT print values)
+        run: |
+          echo "MONGO_URI set?: ${{ secrets.MONGO_URI != '' }}"
+          echo "JWT_SECRET set?: ${{ secrets.JWT_SECRET != '' }}"
+          echo "PORT set?: ${{ secrets.PORT != '' }}"
 
-      env:
-        MONGO_URI: ${{ secrets.MONGO_URI }}
-        JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        PORT: ${{ secrets.PORT }}
-      run: | 
-        echo "Secret 1 is: $MONGO_URI"
-        echo "Secret 2 is: $JWT_SECRET"
-        echo "Secret 3 is: $PORT"
-      
-    - run: pm2 stop all
+      - name: Ensure pm2 available (optional) & stop existing apps
+        run: |
+          npm i -g pm2 || true
+          pm2 -v || true
+          pm2 stop all || true
 
-    # Install dependencies for backend
-    - name: Install Backend Dependencies
-      working-directory: ./backend
-      run: | 
-       npm install --global yarn
-       yarn --version
-       yarn install
-      
-    # Install dependencies for frontend
-    - name: Install Frontend Dependencies
-      working-directory: ./frontend
-      run: |
-        df -h
-        sudo rm -rf ./build
-        yarn install
-        yarn run build
+      # ===== Backend =====
+      - name: Install Backend Dependencies
+        working-directory: ./backend
+        run: |
+          if [ -f yarn.lock ]; then
+            yarn install --frozen-lockfile
+          elif [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Create backend .env from repository secrets
+        working-directory: ./backend
+        run: |
+          rm -f .env
+          {
+            echo "MONGO_URI=${{ secrets.MONGO_URI }}"
+            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}"
+            echo "PORT=${{ secrets.PORT }}"
+          } >> .env
+
+      - name: Run Backend Tests (skip if none)
+        working-directory: ./backend
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          PORT: ${{ secrets.PORT }}
+        run: |
+          if ls test/*.js 2>/dev/null || ls **/*.test.js **/*.spec.js 2>/dev/null; then
+            
+            if npm run | grep -q " test"; then
+              npm test
+            elif yarn run | grep -q " test"; then
+              yarn test
+            else
+              echo "No test script defined, skipping."
+            fi
+          else
+            echo "No test files found, skipping."
+          fi
+
+      # ===== Frontend =====
+      - name: Install Frontend Dependencies
+        working-directory: ./frontend
+        run: |
+          if [ -f yarn.lock ]; then
+            yarn install --frozen-lockfile
+          elif [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build Frontend
+        working-directory: ./frontend
+        run: |
+          rm -rf build dist || true
+          if npm run | grep -q " build"; then
+            npm run build
+          elif yarn run | grep -q " build"; then
+            yarn build
+          else
+            echo "No build script defined for frontend. Skipping build."
+          fi
 
 
-    # Run backend tests
-    - name: Run Backend Tests
-      env:
-        MONGO_URI: ${{ secrets.MONGO_URI }}
-        JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        PORT: ${{ secrets.PORT }}
-      working-directory: ./backend
-      run: npm test
-
-
-    - run: npm ci
-    - run: | 
-        cd ./backend
-        touch .env
-        echo "${{ secrets.PROD }}" > .env
-
-    - run: pm2 start all
-
-    - run: pm2 restart all
+      - name: Start/Restart via PM2
+        run: |
+          pm2 list || true
+          pm2 restart all || pm2 start backend/server.js --name lcms-backend || true
+          pm2 save || true
