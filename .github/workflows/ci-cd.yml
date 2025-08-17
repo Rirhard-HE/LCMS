@@ -3,6 +3,12 @@ name: Backend & Frontend CI/CD (optimized, detect nginx root)
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -10,20 +16,22 @@ concurrency:
 
 jobs:
   build-and-deploy:
-    runs-on: self-hosted
+    runs-on: [self-hosted, linux, X64]   # 明确锁定到你的 EC2 自建 Runner
     timeout-minutes: 45
-
+    defaults:
+      run:
+        shell: bash
     env:
       NODE_VERSION: '22'
       PROCESS_NAME: 'lcms-backend'
       BACKEND_ENTRY: 'backend/server.js'
-      CRA_CI_FLAG: ''
+      CRA_CI_FLAG: ''  # CRA 构建不要把 warning 当失败
 
     steps:
-      - name: Checkout (shallow)
+      - name: Checkout (fetch 2 commits for diff)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -43,20 +51,39 @@ jobs:
 
       - name: Verify secrets presence (masked)
         run: |
-          if [ -n "${{ secrets.MONGO_URI }}" ]; then echo "MONGO_URI set? true"; else echo "MONGO_URI set? false"; fi
-          if [ -n "${{ secrets.JWT_SECRET }}" ]; then echo "JWT_SECRET set? true"; else echo "JWT_SECRET set? false"; fi
-          if [ -n "${{ secrets.PORT }}" ]; then echo "PORT set? true"; else echo "PORT set? false"; fi
+          for k in MONGO_URI JWT_SECRET PORT; do
+            v="${{ secrets.MONGO_URI }}"; :; done
+          echo "MONGO_URI set? $([ -n "${{ secrets.MONGO_URI }}" ] && echo true || echo false)"
+          echo "JWT_SECRET set? $([ -n "${{ secrets.JWT_SECRET }}" ] && echo true || echo false)"
+          echo "PORT set? $([ -n "${{ secrets.PORT }}" ] && echo true || echo false)"
 
       - name: Ensure pm2 available
         run: |
           npm i -g pm2 || true
           pm2 -v || true
 
-      # ---------- Change detection ----------
+      # ---------- Robust change detection ----------
+      - name: Resolve base ref for diff (handles first push)
+        id: base
+        run: |
+          set -e
+          BEFORE="${{ github.event.before }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            if git rev-parse HEAD^ >/dev/null 2>&1; then
+              echo "ref=$(git rev-parse HEAD^)" >> "$GITHUB_OUTPUT"
+            else
+              echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "ref=$BEFORE" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Detect backend changes
         id: diff_be
         run: |
-          if git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep '^backend/' >/dev/null 2>&1; then
+          set -e
+          BASE="${{ steps.base.outputs.ref }}"
+          if git diff --name-only "$BASE" HEAD | grep -q '^backend/'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -65,9 +92,11 @@ jobs:
       - name: Detect frontend presence & changes
         id: diff_fe
         run: |
+          set -e
           if [ -d frontend ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
-            if git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep '^frontend/' >/dev/null 2>&1; then
+            BASE="${{ steps.base.outputs.ref }}"
+            if git diff --name-only "$BASE" HEAD | grep -q '^frontend/'; then
               echo "changed=true" >> "$GITHUB_OUTPUT"
             else
               echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -77,60 +106,48 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # ---------- Global npm cache ----------
+      # ---------- Cache (optional) ----------
       - name: Cache ~/.npm (tarballs)
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ~/.npm
           key: ${{ runner.os }}-npm-${{ hashFiles('backend/package-lock.json', 'frontend/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-
+          restore-keys: ${{ runner.os }}-npm-
 
       # ====================== Backend ======================
-      - name: Cache backend/node_modules
-        if: steps.diff_be.outputs.changed == 'true'
-        id: be_mod_cache
-        uses: actions/cache@v3
-        with:
-          path: backend/node_modules
-          key: ${{ runner.os }}-be-mod-${{ hashFiles('backend/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-be-mod-
-
-      - name: Install Backend Dependencies (skip if cache hit)
-        if: steps.diff_be.outputs.changed == 'true' && steps.be_mod_cache.outputs.cache-hit == 'true'
-        run: echo "backend node_modules cache hit, skipping install."
-
-      - name: Install Backend Dependencies
-        if: steps.diff_be.outputs.changed == 'true' && steps.be_mod_cache.outputs.cache-hit != 'true'
+      - name: Ensure Backend Dependencies (install if missing OR changed)
         working-directory: ./backend
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci --prefer-offline --no-audit --no-fund
+          NEED_INSTALL=0
+          [ ! -d node_modules ] && NEED_INSTALL=1
+          if [ "${{ steps.diff_be.outputs.changed }}" = "true" ]; then NEED_INSTALL=1; fi
+          if [ $NEED_INSTALL -eq 1 ]; then
+            if [ -f package-lock.json ]; then
+              npm ci --prefer-offline --no-audit --no-fund
+            else
+              npm install --prefer-offline --no-audit --no-fund
+            fi
           else
-            npm install --prefer-offline --no-audit --no-fund
+            echo "backend deps up-to-date; skip install"
           fi
 
-      - name: Create backend .env
-        if: steps.diff_be.outputs.changed == 'true'
+      - name: Ensure backend .env (always refresh)
         working-directory: ./backend
         run: |
-          rm -f .env
-          {
-            echo "MONGO_URI=${{ secrets.MONGO_URI }}"
-            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}"
-            echo "PORT=${{ secrets.PORT }}"
-          } >> .env
+          cat > .env <<EOF
+          MONGO_URI=${{ secrets.MONGO_URI }}
+          JWT_SECRET=${{ secrets.JWT_SECRET }}
+          PORT=${{ secrets.PORT }}
+          EOF
 
-      - name: Run Backend Tests (skip if none)
-        if: steps.diff_be.outputs.changed == 'true'
+      - name: Run Backend Tests (if present)
         working-directory: ./backend
         env:
           MONGO_URI: ${{ secrets.MONGO_URI }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           PORT: ${{ secrets.PORT }}
         run: |
-          if [ -f package.json ] && grep -q "\"test\"" package.json; then
+          if [ -f package.json ] && jq -er '.scripts.test // empty' package.json >/dev/null 2>&1; then
             npm test
           elif ls test/*.js 2>/dev/null || ls **/*.test.js **/*.spec.js 2>/dev/null; then
             npm test
@@ -138,44 +155,37 @@ jobs:
             echo "No backend tests found, skipping."
           fi
 
-      - name: Restart/Start backend with PM2
+      - name: Restart/Start backend with PM2 (update env)
         run: |
-          pm2 restart "${{ env.PROCESS_NAME }}" || pm2 start "${{ env.BACKEND_ENTRY }}" --name "${{ env.PROCESS_NAME }}"
+          pm2 restart "${{ env.PROCESS_NAME }}" --update-env || pm2 start "${{ env.BACKEND_ENTRY }}" --name "${{ env.PROCESS_NAME }}"
           pm2 save || true
 
       # ====================== Frontend ======================
-      - name: Cache frontend/node_modules
-        if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true'
-        id: fe_mod_cache
-        uses: actions/cache@v3
-        with:
-          path: frontend/node_modules
-          key: ${{ runner.os }}-fe-mod-${{ hashFiles('frontend/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-fe-mod-
-
-      - name: Install Frontend Dependencies (skip if cache hit)
-        if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true' && steps.fe_mod_cache.outputs.cache-hit == 'true'
-        run: echo "frontend node_modules cache hit, skipping install."
-
-      - name: Install Frontend Dependencies
-        if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true' && steps.fe_mod_cache.outputs.cache-hit != 'true'
+      - name: Ensure Frontend Dependencies (install if missing OR changed)
+        if: steps.diff_fe.outputs.present == 'true'
         working-directory: ./frontend
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci --prefer-offline --no-audit --no-fund
+          NEED_INSTALL=0
+          [ ! -d node_modules ] && NEED_INSTALL=1
+          if [ "${{ steps.diff_fe.outputs.changed }}" = "true" ]; then NEED_INSTALL=1; fi
+          if [ $NEED_INSTALL -eq 1 ]; then
+            if [ -f package-lock.json ]; then
+              npm ci --prefer-offline --no-audit --no-fund
+            else
+              npm install --prefer-offline --no-audit --no-fund
+            fi
           else
-            npm install --prefer-offline --no-audit --no-fund
+            echo "frontend deps up-to-date; skip install"
           fi
 
-      - name: "Build Frontend (CRA: do not fail on warnings)"
-        if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true'
+      - name: Build Frontend (CRA tolerant)
+        if: steps.diff_fe.outputs.present == 'true'
         working-directory: ./frontend
         env:
           CI: ${{ env.CRA_CI_FLAG }}
         run: |
-          rm -rf build dist || true
           if npm run | grep -q " build"; then
+            rm -rf build dist || true
             npm run build
           else
             echo "No build script defined for frontend. Skipping build."
@@ -188,20 +198,21 @@ jobs:
           set -e
           ROOT="$(sudo nginx -T 2>/dev/null | grep -i ' root ' | grep -v '#' | head -n1 | awk '{print $2}' | sed 's/;//')"
           if [ -z "$ROOT" ]; then
-            if [ -d /usr/share/nginx/html ]; then
-              ROOT="/usr/share/nginx/html"
-            else
-              ROOT="/var/www/html"
-            fi
+            if [ -d /usr/share/nginx/html ]; then ROOT="/usr/share/nginx/html"; else ROOT="/var/www/html"; fi
           fi
           echo "NGINX_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "Detected nginx root: $ROOT"
 
-      - name: Deploy Frontend to Nginx root
-        if: steps.diff_fe.outputs.present == 'true' && steps.diff_fe.outputs.changed == 'true'
+      - name: Deploy Frontend to Nginx root (on change OR first publish)
+        if: steps.diff_fe.outputs.present == 'true'
         run: |
           echo "Target: $NGINX_ROOT"
           sudo mkdir -p "$NGINX_ROOT"
-          sudo rm -rf "$NGINX_ROOT"/*
-          sudo cp -r frontend/build/* "$NGINX_ROOT"/
-          sudo nginx -t && sudo systemctl reload nginx || true
+          if [ "${{ steps.diff_fe.outputs.changed }}" = "true" ] || [ ! -f "$NGINX_ROOT/index.html" ]; then
+            sudo rm -rf "$NGINX_ROOT"/*
+            sudo cp -r frontend/build/* "$NGINX_ROOT"/
+            sudo nginx -t && sudo systemctl reload nginx || true
+            echo "Frontend deployed."
+          else
+            echo "No FE change and target already has index.html; skipping copy."
+          fi
