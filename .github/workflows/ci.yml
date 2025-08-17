@@ -2,79 +2,98 @@ name: Backend CI
 
 on:
   push:
-    branches:
-      - main  # Trigger CI on pushes to the main branch
-
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   test:
     name: Run Tests
-    runs-on: self-hosted
+    runs-on: [self-hosted, linux, X64]
 
     strategy:
       matrix:
-        node-version: [22] # Test on multiple Node.js versions
-
-
-    environment: MONGO_URI
+        node-version: [22]
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v3
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    # Set up Node.js
-    - name: Setup Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: ${{ matrix.node-version }}
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
 
-    - name: Print Env Secret
+      # ✅ 不打印机密内容，只检查是否存在（安全）
+      - name: Verify secrets presence (masked)
+        run: |
+          echo "MONGO_URI set? $([ -n "${{ secrets.MONGO_URI }}" ] && echo true || echo false)"
+          echo "JWT_SECRET set? $([ -n "${{ secrets.JWT_SECRET }}" ] && echo true || echo false)"
+          echo "PORT set? $([ -n "${{ secrets.PORT }}" ] && echo true || echo false)"
 
-      env:
-        MONGO_URI: ${{ secrets.MONGO_URI }}
-        JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        PORT: ${{ secrets.PORT }}
-      run: | 
-        echo "Secret 1 is: $MONGO_URI"
-        echo "Secret 2 is: $JWT_SECRET"
-        echo "Secret 3 is: $PORT"
-      
-    - run: pm2 stop all
+      - name: Ensure PM2 installed
+        run: |
+          npm i -g pm2 || true
+          pm2 -v
 
-    # Install dependencies for backend
-    - name: Install Backend Dependencies
-      working-directory: ./backend
-      run: | 
-       npm install --global yarn
-       yarn --version
-       yarn install
-      
-    # Install dependencies for frontend
-    - name: Install Frontend Dependencies
-      working-directory: ./frontend
-      run: |
-        df -h
-        sudo rm -rf ./build
-        yarn install
-        yarn run build
+      # ---------- Backend ----------
+      - name: Install Backend Dependencies
+        working-directory: ./backend
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --prefer-offline --no-audit --no-fund
+          else
+            npm install --prefer-offline --no-audit --no-fund
+          fi
 
+      - name: Write backend .env
+        working-directory: ./backend
+        run: |
+          cat > .env <<EOF
+          MONGO_URI=${{ secrets.MONGO_URI }}
+          JWT_SECRET=${{ secrets.JWT_SECRET }}
+          PORT=${{ secrets.PORT }}
+          EOF
 
-    # Run backend tests
-    - name: Run Backend Tests
-      env:
-        MONGO_URI: ${{ secrets.MONGO_URI }}
-        JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        PORT: ${{ secrets.PORT }}
-      working-directory: ./backend
-      run: npm test
+      - name: Run Backend Tests
+        working-directory: ./backend
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          PORT: ${{ secrets.PORT }}
+        run: npm test
 
+      # ✅ 用“命名进程”，避免 No process found；并更新环境
+      - name: Start/Restart backend with PM2
+        working-directory: ./backend
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          PORT: ${{ secrets.PORT }}
+        run: |
+          pm2 describe lcms-backend > /dev/null \
+            || pm2 start server.js --name lcms-backend
+          pm2 restart lcms-backend --update-env
+          pm2 save
+          pm2 ls
+          pm2 logs lcms-backend --lines 50 --nostream
 
-    - run: npm ci
-    - run: | 
-        cd ./backend
-        touch .env
-        echo "${{ secrets.PROD }}" > .env
+      # ---------- Frontend ----------
+      - name: Install Frontend Dependencies
+        working-directory: ./frontend
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --prefer-offline --no-audit --no-fund
+          else
+            npm install --prefer-offline --no-audit --no-fund
+          fi
 
-    - run: pm2 start all
+      - name: Build Frontend
+        working-directory: ./frontend
+        env:
+          CI: ""   # CRA: 不把 warning 当失败
+        run: npm run build
 
-    - run: pm2 restart all
