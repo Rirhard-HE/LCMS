@@ -51,4 +51,4 @@ Username: 1109912480@qq.com
 
 Password: 12345678
 
-(You can change these later in MongoDB Atlas or via your seeder script.)
+
