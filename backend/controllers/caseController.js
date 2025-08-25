@@ -44,7 +44,7 @@ const updateCase = asyncHandler(async (req, res) => {
   res.json(found);
 });
 
-// DELETE /api/cases/:id  （仅允许作者删除）
+
 const deleteCase = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const found = await Case.findById(id);
