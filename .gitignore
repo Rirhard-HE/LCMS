@@ -7,10 +7,7 @@ build/
 dist/
 coverage/
 
-# environment
-.env
-.env.*
-!.env.example
+
 
 # logs & editor
 *.log
